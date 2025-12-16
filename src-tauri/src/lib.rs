@@ -1,9 +1,12 @@
 use ignore::WalkBuilder;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::Emitter;
-
 const MENU_OPEN_FOLDER: &str = "open-folder";
 const MENU_QUIT: &str = "quit";
+
+mod terminal;
+
+use terminal::{resize_terminal, spawn_terminal, write_to_terminal, AppState};
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -52,6 +55,7 @@ fn list_files(path: &str) -> Result<Vec<String>, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let file_open = MenuItemBuilder::new("Open Folder")
                 .id(MENU_OPEN_FOLDER)
@@ -63,9 +67,7 @@ pub fn run() {
                 .accelerator("CmdOrCtrl+Q")
                 .build(app)?;
 
-            let app_menu = SubmenuBuilder::new(app, "Visor")
-                .items(&[&quit])
-                .build()?;
+            let app_menu = SubmenuBuilder::new(app, "Visor").items(&[&quit]).build()?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
                 .items(&[&file_open])
@@ -89,7 +91,14 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![greet, list_files])
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            list_files,
+            spawn_terminal,
+            write_to_terminal,
+            resize_terminal
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

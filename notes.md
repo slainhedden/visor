@@ -10,5 +10,14 @@
   - Wire PTY for the terminal (Tauri command spawning a shell, hook xterm).
   - Replace chip cloud with real codemap visualization + selection/pinning flow.
   - Persist open path and pinned context; integrate context bundle export with agents.
-  - Consider streaming walker/FS watch for live updates; handle large repos (chunked rendering).
-  - Tighten theming/spacing once data overlays land.
+- Consider streaming walker/FS watch for live updates; handle large repos (chunked rendering).
+- Tighten theming/spacing once data overlays land.
+
+## Add real PTY, resize, and clipboard support
+
+- Terminal now spawns a real shell via portable-pty (default SHELL/COMSPEC), with reader thread emitting `term-data` and writer command `write_to_terminal`.
+- PTY resizing works: master stored in session; `resize_terminal` resizes PTY. Frontend `ResizeObserver` fits xterm and sends cols/rows; initial resize sent on mount. `stty size` reflects UI size after resize.
+- Clipboard: added `@tauri-apps/plugin-clipboard-manager`; Cmd/Ctrl+V reads clipboard and writes to PTY; Cmd/Ctrl+C copies selection (passes through to shell when no selection). Paste also handled via onPaste fallback. Requires permission in capabilities (added).
+- Layout unchanged: resizable sidebar/console via thin handles; codemap chips still placeholder.
+- Tests: `cd src-tauri && cargo test` passes. Build via `npm run build`.
+- Remaining: richer codemap, PTY lifecycle hardening, persist open path/pins, streaming FS updates.
