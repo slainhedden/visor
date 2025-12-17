@@ -1,16 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useEffect, useMemo, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
-import "@xterm/xterm/css/xterm.css";
 
 type PinnedItem = {
   id: string;
   label: string;
   path: string;
+};
+
+type AgentSummary = {
+  id: string;
+  label: string;
+};
+
+type SessionInfo = {
+  agent_id: string;
+  session_id: string;
+};
+
+type ChatEntry = {
+  id: string;
+  role: "user" | "assistant" | "status";
+  content: string;
+  streaming?: boolean;
+};
+
+type AcpUpdateEvent = {
+  type: "chat_message" | "status_update" | "error";
+  session_id: string;
+  content: string;
 };
 
 const initialPinned: PinnedItem[] = [
@@ -19,170 +38,35 @@ const initialPinned: PinnedItem[] = [
   { id: "3", label: "agents/context_bundle.md", path: "agents/context_bundle.md" },
 ];
 
-function ContextItem({
-  item,
-  onRemove,
-}: {
-  item: PinnedItem;
-  onRemove: (id: string) => void;
-}) {
-  return (
-    <div className="flex items-center justify-between rounded-md bg-white/20 px-2 py-1 text-xs text-slate-900 ring-1 ring-white/30">
-      <span className="truncate text-[11px] font-medium text-white">
-        {item.label}
-      </span>
-      <button
-        onClick={() => onRemove(item.id)}
-        className="ml-2 rounded-full bg-slate-900/70 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-slate-900/80 active:bg-slate-900"
-        aria-label={`Remove ${item.label}`}
-      >
-        ×
-      </button>
-    </div>
-  );
+const tabs = [
+  { id: "codemap", label: "Codemap" },
+  { id: "files", label: "Files" },
+  { id: "preview", label: "Preview" },
+] as const;
+
+type TabId = (typeof tabs)[number]["id"];
+
+function createId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function App() {
-  const terminalRef = useRef<HTMLDivElement | null>(null);
-  const terminalContainerRef = useRef<HTMLDivElement | null>(null);
-  const fitAddon = useMemo(() => new FitAddon(), []);
   const [openPath, setOpenPath] = useState<string | null>(null);
-  const [sidebarWidth, setSidebarWidth] = useState<number>(260);
-  const [consoleHeight, setConsoleHeight] = useState<number>(240);
-  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
-  const [isResizingConsole, setIsResizingConsole] = useState(false);
-  const [pinnedItems, setPinnedItems] = useState<PinnedItem[]>(initialPinned);
+  const [pinnedItems, setPinnedItems] =
+    useState<PinnedItem[]>(initialPinned);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "error">(
     "idle",
   );
   const [codemapFiles, setCodemapFiles] = useState<string[]>([]);
-  const termInstanceRef = useRef<Terminal | null>(null);
-  const termDataUnlistenRef = useRef<UnlistenFn | null>(null);
-  const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
-  const spawnedRef = useRef(false);
-  const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
-  const resizeObserverRef = useRef<ResizeObserver | null>(null);
-  const pasteFallback = async () => {
-    try {
-      const text = await readText();
-      return text;
-    } catch (err) {
-      console.error("read clipboard failed", err);
-      return "";
-    }
-  };
-
-  useEffect(() => {
-    if (!terminalRef.current) return;
-
-    const term = new Terminal({
-      convertEol: true,
-      disableStdin: false,
-      fontFamily: "SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      fontSize: 13,
-      cursorBlink: true,
-      theme: {
-        background: "#0d1117",
-        foreground: "#e5e7eb",
-        black: "#000000",
-        red: "#ff7b72",
-        green: "#3fb950",
-        yellow: "#e3b341",
-        blue: "#58a6ff",
-        magenta: "#bc8cff",
-        cyan: "#39c5cf",
-        white: "#c9d1d9",
-      },
-    });
-
-    term.loadAddon(fitAddon);
-    term.open(terminalRef.current);
-    termInstanceRef.current = term;
-    term.attachCustomKeyEventHandler((arg) => {
-      if (arg.type !== "keydown") return true;
-      const isPaste = (arg.ctrlKey || arg.metaKey) && arg.key.toLowerCase() === "v";
-      const isCopy = (arg.ctrlKey || arg.metaKey) && arg.key.toLowerCase() === "c";
-
-      if (isPaste) {
-        pasteFallback().then((text) => {
-          if (text) {
-            void invoke("write_to_terminal", { data: text }).catch((err) =>
-              console.error("write failed", err),
-            );
-          }
-        });
-        return false;
-      }
-
-      if (isCopy) {
-        const selection = term.getSelection();
-        if (selection) {
-          writeText(selection).catch((err) => console.error("write clipboard failed", err));
-          return false;
-        }
-        return true; // allow Ctrl+C to shell when no selection
-      }
-
-      return true;
-    });
-    if (!spawnedRef.current) {
-      spawnedRef.current = true;
-      void invoke("spawn_terminal").catch((err) =>
-        console.error("spawn terminal failed", err),
-      );
-    }
-    term.writeln("\x1b[1;36mVisor terminal\x1b[0m");
-    term.writeln("Shell spawned via portable-pty.");
-    term.focus();
-    const disposeOnData = term.onData((data) => {
-      void invoke("write_to_terminal", { data }).catch((err) =>
-        console.error("write failed", err),
-      );
-    });
-    onDataDisposableRef.current = disposeOnData;
-    fitAddon.fit();
-    const initialDims = fitAddon.proposeDimensions();
-    if (initialDims) {
-      lastSizeRef.current = {
-        cols: initialDims.cols,
-        rows: initialDims.rows,
-      };
-      void invoke("resize_terminal", {
-        cols: initialDims.cols,
-        rows: initialDims.rows,
-      }).catch((err) => console.error("resize_terminal failed", err));
-    }
-
-    let resizeObserver: ResizeObserver | null = null;
-    if (terminalContainerRef.current) {
-      resizeObserver = new ResizeObserver(() => {
-        if (!termInstanceRef.current) return;
-        fitAddon.fit();
-        const dims = fitAddon.proposeDimensions();
-        if (dims) {
-          const { cols, rows } = dims;
-          const last = lastSizeRef.current;
-          if (!last || last.cols !== cols || last.rows !== rows) {
-            lastSizeRef.current = { cols, rows };
-            void invoke("resize_terminal", { cols, rows }).catch((err) =>
-              console.error("resize_terminal failed", err),
-            );
-          }
-        }
-      });
-      resizeObserver.observe(terminalContainerRef.current);
-    }
-
-    return () => {
-      if (resizeObserver && terminalContainerRef.current) {
-        resizeObserver.unobserve(terminalContainerRef.current);
-      }
-      disposeOnData.dispose();
-      onDataDisposableRef.current = null;
-      term.dispose();
-      termInstanceRef.current = null;
-    };
-  }, [fitAddon]);
+  const [activeTab, setActiveTab] = useState<TabId>("codemap");
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionStatus, setSessionStatus] = useState<
+    "idle" | "starting" | "active" | "error"
+  >("idle");
+  const [chatEntries, setChatEntries] = useState<ChatEntry[]>([]);
+  const [composerText, setComposerText] = useState("");
 
   useEffect(() => {
     const unlistenPromise = listen("menu://open-folder", () => {
@@ -194,55 +78,72 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const listenPromise = listen<string>("term-data", (event) => {
-      const data = event.payload;
-      if (termInstanceRef.current) {
-        termInstanceRef.current.write(data);
-      }
-    });
-    listenPromise.then((fn) => {
-      termDataUnlistenRef.current = fn;
-    });
-
-    return () => {
-      if (termDataUnlistenRef.current) {
-        termDataUnlistenRef.current?.();
-        termDataUnlistenRef.current = null;
-      } else {
-        listenPromise.then((fn) => fn()).catch(() => {});
-      }
-    };
+    void invoke<AgentSummary[]>("acp_list_agents")
+      .then((list) => {
+        setAgents(list);
+        if (!selectedAgentId && list.length > 0) {
+          setSelectedAgentId(list[0].id);
+        }
+      })
+      .catch((err) => console.error("Failed to load agents", err));
   }, []);
 
   useEffect(() => {
-    if (!terminalContainerRef.current) return;
-    const observer = new ResizeObserver(() => {
-      if (termInstanceRef.current) {
-        fitAddon.fit();
-        const dims = fitAddon.proposeDimensions();
-        if (dims) {
-          const { cols, rows } = dims;
-          const last = lastSizeRef.current;
-          if (!last || last.cols !== cols || last.rows !== rows) {
-            lastSizeRef.current = { cols, rows };
-            void invoke("resize_terminal", { cols, rows }).catch((err) =>
-              console.error("resize_terminal failed", err),
-            );
-          }
-        }
+    const unlistenPromise = listen<AcpUpdateEvent>("acp://update", (event) => {
+      const payload = event.payload;
+      if (payload.type === "chat_message") {
+        appendAssistantChunk(payload.content);
+      } else if (payload.type === "status_update") {
+        appendStatus(payload.content);
+      } else if (payload.type === "error") {
+        appendStatus(`Error: ${payload.content}`);
       }
     });
-    observer.observe(terminalContainerRef.current);
-    resizeObserverRef.current = observer;
-    return () => {
-      observer.disconnect();
-      resizeObserverRef.current = null;
-    };
-  }, [fitAddon]);
 
-  const truncatePath = (value: string | null, max = 60) => {
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  const stats = useMemo(
+    () => [
+      { label: "Session", value: sessionStatus },
+      { label: "Agent", value: selectedAgentId ?? "none" },
+    ],
+    [selectedAgentId, sessionStatus],
+  );
+
+  const truncatePath = (value: string | null, max = 48) => {
     if (!value) return "No folder selected";
     return value.length > max ? `…${value.slice(value.length - max)}` : value;
+  };
+
+  const appendAssistantChunk = (chunk: string) => {
+    setChatEntries((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === "assistant" && last.streaming) {
+        return [
+          ...prev.slice(0, -1),
+          { ...last, content: `${last.content}${chunk}` },
+        ];
+      }
+      return [
+        ...prev,
+        {
+          id: createId("assistant"),
+          role: "assistant",
+          content: chunk,
+          streaming: true,
+        },
+      ];
+    });
+  };
+
+  const appendStatus = (message: string) => {
+    setChatEntries((prev) => [
+      ...prev,
+      { id: createId("status"), role: "status", content: message },
+    ]);
   };
 
   const handleOpenFolder = async () => {
@@ -257,13 +158,10 @@ function App() {
       setOpenPath(path);
       const result = await invoke<string[]>("list_files", { path });
       setCodemapFiles(result);
+      appendStatus("Folder loaded. Ready to start ACP session.");
     } catch (err) {
       console.error("Failed to open folder", err);
     }
-  };
-
-  const handleRemove = (id: string) => {
-    setPinnedItems((prev) => prev.filter((item) => item.id !== id));
   };
 
   const handleCopyBundle = async () => {
@@ -286,172 +184,305 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    const handleMouseMove = (event: MouseEvent) => {
-      if (isResizingSidebar) {
-        const next = Math.min(Math.max(event.clientX, 180), 480);
-        setSidebarWidth(next);
-      }
-      if (isResizingConsole) {
-        const vh = window.innerHeight;
-        const next = Math.min(Math.max(vh - event.clientY, 160), vh - 120);
-        setConsoleHeight(next);
-      }
-    };
-
-    const handleMouseUp = () => {
-      setIsResizingSidebar(false);
-      setIsResizingConsole(false);
-      document.body.style.userSelect = "";
-      fitAddon.fit();
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [isResizingSidebar, isResizingConsole, fitAddon]);
-
-  const startResizeSidebar = () => {
-    setIsResizingSidebar(true);
-    document.body.style.userSelect = "none";
+  const handleRemovePinned = (id: string) => {
+    setPinnedItems((prev) => prev.filter((item) => item.id !== id));
   };
 
-  const startResizeConsole = () => {
-    setIsResizingConsole(true);
-    document.body.style.userSelect = "none";
+  const handleStartSession = async () => {
+    if (!selectedAgentId) {
+      appendStatus("Select an agent before starting a session.");
+      return;
+    }
+    if (!openPath) {
+      appendStatus("Select a folder before starting a session.");
+      return;
+    }
+    setSessionStatus("starting");
+    try {
+      const info = await invoke<SessionInfo>("acp_start_session", {
+        agent_id: selectedAgentId,
+        root_dir: openPath,
+      });
+      setSessionId(info.session_id);
+      setSessionStatus("active");
+      appendStatus(`Session started (${info.agent_id}).`);
+    } catch (err) {
+      console.error("Failed to start ACP session", err);
+      setSessionStatus("error");
+      appendStatus("Failed to start ACP session.");
+    }
+  };
+
+  const handleStopSession = async () => {
+    try {
+      await invoke("acp_stop_session");
+      setSessionId(null);
+      setSessionStatus("idle");
+      appendStatus("Session stopped.");
+    } catch (err) {
+      console.error("Failed to stop session", err);
+      appendStatus("Failed to stop session.");
+    }
+  };
+
+  const handleSendPrompt = async () => {
+    if (!composerText.trim()) return;
+    if (!sessionId) {
+      appendStatus("Start a session before sending prompts.");
+      return;
+    }
+
+    const text = composerText.trim();
+    setChatEntries((prev) => [
+      ...prev,
+      { id: createId("user"), role: "user", content: text },
+    ]);
+    setComposerText("");
+
+    try {
+      await invoke("acp_send_prompt", { text });
+    } catch (err) {
+      console.error("Failed to send prompt", err);
+      appendStatus("Prompt failed to send.");
+    }
   };
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-white text-slate-900">
-      {/* top bar removed per spec; menu handles File -> Open Folder */}
-      <div className="flex h-full flex-col" style={{ gridTemplateRows: "auto" }}>
-        <div
-          className="flex min-h-0 flex-1"
-          style={{ gridTemplateRows: "auto" }}
-        >
-          <aside
-            className="flex flex-col border-r border-slate-200 bg-slate-900/95 px-4 py-4 text-white backdrop-blur"
-            style={{ width: sidebarWidth }}
-          >
-            <p className="text-base font-semibold text-white">Visor</p>
-            <p className="mt-3 text-[11px] uppercase tracking-[0.08em] text-slate-300">
-              Context Actions
-            </p>
-            <div className="mt-3 flex items-center justify-between rounded-md bg-white/5 px-3 py-2 ring-1 ring-white/10">
-              <span className="text-[11px] font-medium text-white">
-                Copy Bundle
-              </span>
-              <button
-                onClick={handleCopyBundle}
-                className="rounded-md bg-emerald-500 px-2 py-1 text-[11px] font-semibold text-white shadow-sm hover:bg-emerald-400 active:bg-emerald-500"
-              >
-                Copy
-              </button>
-            </div>
-            {copyState === "copied" && (
-              <p className="mt-2 text-[11px] text-emerald-200">Copied!</p>
-            )}
-            {copyState === "error" && (
-              <p className="mt-2 text-[11px] text-rose-200">
-                Nothing to copy yet.
-              </p>
-            )}
-
-            <p className="mt-5 text-[11px] uppercase tracking-[0.08em] text-slate-300">
-              Pinned context
-            </p>
-            <div className="mt-3 flex-1 space-y-2 overflow-y-auto pr-1">
-              {pinnedItems.length === 0 ? (
-                <p className="rounded-md bg-white/5 px-3 py-2 text-[12px] text-slate-300 ring-1 ring-white/10">
-                  No items pinned yet.
-                </p>
-              ) : (
-                pinnedItems.map((item) => (
-                  <ContextItem
-                    key={item.id}
-                    item={item}
-                    onRemove={handleRemove}
-                  />
-                ))
-              )}
-            </div>
-          </aside>
-
-          <div
-            className="w-[2px] cursor-col-resize bg-slate-300/70 hover:bg-slate-500/80 active:bg-slate-600"
-            onMouseDown={startResizeSidebar}
-            aria-label="Resize sidebar"
-          />
-
-          <section
-            className="relative flex-1"
-            style={{
-              backgroundColor: "#54626F",
-              backgroundImage:
-                "radial-gradient(rgba(255,255,255,0.15) 1px, transparent 0), radial-gradient(rgba(255,255,255,0.15) 1px, transparent 0)",
-              backgroundPosition: "0 0, 14px 14px",
-              backgroundSize: "28px 28px",
-            }}
-          >
-            <div className="absolute inset-x-0 top-0 flex items-center justify-between px-4 py-3 text-xs text-white/80">
-              <div className="rounded-md bg-black/20 px-3 py-1 ring-1 ring-white/10">
-                {truncatePath(openPath)}
+    <div className="h-screen w-screen bg-[var(--app-bg)] text-slate-100">
+      <div className="relative h-full w-full bg-[radial-gradient(circle_at_top,rgba(59,130,246,0.08),transparent_55%),radial-gradient(circle_at_bottom,rgba(20,184,166,0.08),transparent_50%)]">
+        <div className="absolute inset-0 bg-gradient-to-br from-slate-900/90 via-slate-900/80 to-slate-950/90" />
+        <div className="relative z-10 flex h-full gap-4 p-4">
+          <section className="flex w-[55%] flex-col rounded-2xl border border-white/10 bg-slate-900/40 p-4">
+            <header className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-white">Visor Session</p>
               </div>
-              <div className="rounded-md bg-black/20 px-3 py-1 ring-1 ring-white/10">
-                Files: {codemapFiles.length}
+              <div className="flex items-center gap-2">
+                <select
+                  value={selectedAgentId ?? ""}
+                  onChange={(event) => setSelectedAgentId(event.target.value)}
+                  className="rounded-full border border-white/10 bg-slate-900/60 px-3 py-1 text-[11px] text-slate-200 focus:border-emerald-400/50 focus:outline-none"
+                >
+                  <option value="" disabled>
+                    Select agent
+                  </option>
+                  {agents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>
+                      {agent.label}
+                    </option>
+                  ))}
+                </select>
+                {sessionStatus === "active" ? (
+                  <button
+                    onClick={handleStopSession}
+                    className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] text-slate-200 hover:bg-white/10"
+                  >
+                    Stop
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleStartSession}
+                    className="rounded-full border border-emerald-400/40 bg-emerald-500/20 px-3 py-1 text-[11px] font-semibold text-emerald-100 hover:bg-emerald-500/30"
+                  >
+                    {sessionStatus === "starting" ? "Starting" : "Start"}
+                  </button>
+                )}
               </div>
+            </header>
+
+            <div className="mt-4 flex items-center gap-2 text-[11px] text-slate-400">
+              {stats.map((stat) => (
+                <span
+                  key={stat.label}
+                  className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5"
+                >
+                  {stat.label}: {stat.value}
+                </span>
+              ))}
             </div>
-            <div className="pointer-events-auto absolute inset-0 flex flex-wrap content-start items-start gap-2 p-4">
-              {codemapFiles.length === 0 ? (
-                <div className="rounded-full bg-white/85 px-4 py-2 text-[11px] font-medium text-slate-600 shadow-sm ring-1 ring-slate-200/60">
-                  Codemap canvas placeholder
+
+            <div className="mt-5 flex-1 space-y-4 overflow-y-auto pr-1">
+              {chatEntries.length === 0 ? (
+                <div className="rounded-2xl border border-white/10 bg-slate-900/40 px-4 py-6 text-center text-[13px] text-slate-300">
+                  Start an ACP session to begin chatting with your agent.
                 </div>
               ) : (
-                codemapFiles.slice(0, 200).map((file) => (
+                chatEntries.map((entry) => {
+                  if (entry.role === "user") {
+                    return (
+                      <div key={entry.id} className="flex justify-end">
+                        <div className="max-w-[78%] rounded-2xl rounded-tr-sm border border-white/10 bg-gradient-to-br from-slate-700/70 to-slate-800/70 px-4 py-3 text-sm text-slate-100">
+                          {entry.content}
+                        </div>
+                      </div>
+                    );
+                  }
+                  if (entry.role === "assistant") {
+                    return (
+                      <div key={entry.id} className="flex justify-start">
+                        <div className="max-w-[80%] rounded-2xl rounded-tl-sm border border-white/10 bg-slate-900/50 px-4 py-3 text-sm text-slate-200">
+                          {entry.content}
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div
+                      key={entry.id}
+                      className="rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-[12px] text-slate-300"
+                    >
+                      {entry.content}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="mt-4 rounded-xl border border-white/10 bg-slate-950/40 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] uppercase tracking-[0.2em] text-slate-500">
+                  Context
+                </span>
+                {pinnedItems.map((item) => (
                   <span
-                    key={file}
-                    className="rounded-full bg-white/80 px-3 py-1 text-[11px] font-medium text-slate-700 shadow-sm ring-1 ring-slate-200"
+                    key={item.id}
+                    className="flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] text-slate-200"
                   >
-                    {file}
+                    <span>{item.label}</span>
+                    <button
+                      type="button"
+                      onClick={() => handleRemovePinned(item.id)}
+                      className="ml-1 rounded-full bg-white/10 px-2 py-0.5 text-[11px] text-slate-200 hover:bg-white/20"
+                      aria-label={`Remove ${item.label}`}
+                    >
+                      ×
+                    </button>
                   </span>
-                ))
+                ))}
+                <button
+                  onClick={handleCopyBundle}
+                  className="ml-auto rounded-full border border-emerald-400/40 bg-emerald-500/20 px-3 py-1 text-[11px] font-semibold text-emerald-100 hover:bg-emerald-500/30"
+                >
+                  Copy bundle
+                </button>
+              </div>
+              {copyState === "copied" && (
+                <p className="mt-2 text-[11px] text-emerald-200">
+                  Bundle copied.
+                </p>
+              )}
+              {copyState === "error" && (
+                <p className="mt-2 text-[11px] text-rose-200">
+                  Nothing to copy yet.
+                </p>
+              )}
+            </div>
+
+            <div className="mt-3 rounded-2xl border border-white/10 bg-slate-900/60 p-3">
+              <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">
+                  Attach
+                </span>
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">
+                  Context
+                </span>
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">
+                  Tools
+                </span>
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">
+                  Settings
+                </span>
+              </div>
+              <div className="mt-3 flex items-center gap-3">
+                <input
+                  type="text"
+                  value={composerText}
+                  onChange={(event) => setComposerText(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void handleSendPrompt();
+                    }
+                  }}
+                  placeholder="Ask Visor to refine the workspace..."
+                  className="w-full rounded-xl border border-white/10 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-emerald-400/50 focus:outline-none"
+                />
+                <button
+                  onClick={() => void handleSendPrompt()}
+                  className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
+                >
+                  Send
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="flex w-[45%] flex-col rounded-2xl border border-white/10 bg-slate-900/50">
+            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <div className="flex items-center gap-2 text-[12px] text-slate-300">
+                {tabs.map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`rounded-full px-3 py-1 text-[12px] font-semibold transition ${
+                      activeTab === tab.id
+                        ? "bg-white/10 text-white"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-hidden">
+              {activeTab === "codemap" && (
+                <div className="relative h-full">
+                  <div className="absolute inset-0 bg-[radial-gradient(rgba(148,163,184,0.18)_1px,transparent_0)] [background-size:26px_26px]" />
+                  <div className="absolute inset-0 bg-gradient-to-b from-slate-950/10 via-transparent to-slate-950/30" />
+                  <div className="relative z-10 flex h-full flex-col">
+                    <div className="flex items-center justify-between px-4 py-3 text-[11px] text-slate-300">
+                      <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">
+                        {truncatePath(openPath)}
+                      </span>
+                      <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">
+                        Files: {codemapFiles.length}
+                      </span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto px-4 pb-4">
+                      {codemapFiles.length === 0 ? (
+                        <div className="mt-10 rounded-2xl border border-white/10 bg-slate-900/60 p-6 text-center text-[13px] text-slate-300">
+                          Load a folder to see the codemap layout. Nodes will
+                          appear here for quick selection and pinning.
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap gap-2">
+                          {codemapFiles.slice(0, 220).map((file) => (
+                            <span
+                              key={file}
+                              className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] text-slate-200"
+                            >
+                              {file}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeTab !== "codemap" && (
+                <div className="flex h-full items-center justify-center text-sm text-slate-400">
+                  {activeTab === "files"
+                    ? "File explorer is coming soon."
+                    : "Preview is coming soon."}
+                </div>
               )}
             </div>
           </section>
         </div>
-
-        <div
-          className="h-[3px] cursor-row-resize bg-slate-300/70 hover:bg-slate-500/80 active:bg-slate-600"
-          onMouseDown={startResizeConsole}
-          aria-label="Resize console"
-        />
-
-          <section
-            className="relative border-t border-slate-200 bg-slate-950"
-            style={{ height: consoleHeight }}
-            ref={terminalContainerRef}
-          >
-            <div className="pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-b from-slate-900/60 to-transparent" />
-            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(59,130,246,0.12),transparent_35%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_35%)]" />
-          <div
-            ref={terminalRef}
-            className="relative z-10 h-full w-full px-4 py-3"
-            aria-label="Terminal placeholder"
-            onPaste={(event) => {
-              event.preventDefault();
-              pasteFallback().then((text) => {
-                if (text) {
-                  void invoke("write_to_terminal", { data: text }).catch(
-                    (err) => console.error("write failed", err),
-                  );
-                }
-              });
-            }}
-          />
-        </section>
       </div>
     </div>
   );

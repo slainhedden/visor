@@ -1,0 +1,11 @@
+{
+  "agents": [
+    {
+      "id": "opencode",
+      "label": "OpenCode",
+      "command": "opencode",
+      "args": [],
+      "env": {}
+    }
+  ]
+}

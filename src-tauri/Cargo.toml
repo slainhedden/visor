@@ -27,3 +27,6 @@ ignore = "0.4"
 tempfile = "3"
 portable-pty = "0.8"
 tauri-plugin-clipboard-manager = "2"
+agent-client-protocol = "0.9"
+tokio = { version = "1", features = ["process", "io-std", "macros", "sync", "fs"] }
+tokio-util = { version = "0.7", features = ["compat"] }
