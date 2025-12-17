@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: "Space Grotesk", "Manrope", "Work Sans", "Noto Sans", "Helvetica Neue", sans-serif;
+  --app-bg: #0b0f17;
+  background-color: var(--app-bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--app-bg);
+}
