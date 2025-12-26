@@ -8,7 +8,10 @@ const MENU_QUIT: &str = "quit";
 mod acp;
 mod terminal;
 
-use acp::{acp_list_agents, acp_reload_config, acp_send_prompt, acp_start_session, acp_stop_session};
+use acp::{
+    acp_list_agents, acp_reload_config, acp_resolve_permission, acp_send_prompt, acp_set_mode,
+    acp_start_session, acp_stop_session,
+};
 use terminal::{resize_terminal, spawn_terminal, write_to_terminal, AppState};
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -111,7 +114,9 @@ pub fn run() {
             acp_reload_config,
             acp_start_session,
             acp_stop_session,
-            acp_send_prompt
+            acp_send_prompt,
+            acp_set_mode,
+            acp_resolve_permission
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

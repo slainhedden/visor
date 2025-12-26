@@ -17,6 +17,10 @@ type AgentSummary = {
 type SessionInfo = {
   agent_id: string;
   session_id: string;
+  modes?: {
+    current_mode_id: string;
+    available_modes: SessionMode[];
+  };
 };
 
 type ChatEntry = {
@@ -27,9 +31,31 @@ type ChatEntry = {
 };
 
 type AcpUpdateEvent = {
-  type: "chat_message" | "status_update" | "error";
+  type: "chat_message" | "status_update" | "error" | "mode_changed" | "permission_request";
   session_id: string;
-  content: string;
+  content?: string;
+  current_mode_id?: string;
+  request_id?: string;
+  message?: string;
+  options?: PermissionOption[];
+};
+
+type SessionMode = {
+  id: string;
+  name: string;
+  description?: string | null;
+};
+
+type PermissionOption = {
+  option_id: string;
+  label: string;
+};
+
+type PermissionRequest = {
+  id: string;
+  sessionId: string;
+  message: string;
+  options: PermissionOption[];
 };
 
 const initialPinned: PinnedItem[] = [
@@ -50,6 +76,21 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function formatInvokeError(err: unknown) {
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    if ("message" in err && typeof err.message === "string") {
+      return err.message;
+    }
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return "unknown error";
+    }
+  }
+  return String(err);
+}
+
 function App() {
   const [openPath, setOpenPath] = useState<string | null>(null);
   const [pinnedItems, setPinnedItems] =
@@ -62,11 +103,14 @@ function App() {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [availableModes, setAvailableModes] = useState<SessionMode[]>([]);
+  const [currentModeId, setCurrentModeId] = useState<string | null>(null);
   const [sessionStatus, setSessionStatus] = useState<
     "idle" | "starting" | "active" | "error"
   >("idle");
   const [chatEntries, setChatEntries] = useState<ChatEntry[]>([]);
   const [composerText, setComposerText] = useState("");
+  const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
 
   useEffect(() => {
     const unlistenPromise = listen("menu://open-folder", () => {
@@ -92,11 +136,27 @@ function App() {
     const unlistenPromise = listen<AcpUpdateEvent>("acp://update", (event) => {
       const payload = event.payload;
       if (payload.type === "chat_message") {
-        appendAssistantChunk(payload.content);
+        if (payload.content) {
+          appendAssistantChunk(payload.content);
+        }
       } else if (payload.type === "status_update") {
-        appendStatus(payload.content);
+        if (payload.content) {
+          appendStatus(payload.content);
+        }
       } else if (payload.type === "error") {
-        appendStatus(`Error: ${payload.content}`);
+        appendStatus(`Error: ${payload.content ?? "unknown error"}`);
+      } else if (payload.type === "mode_changed" && payload.current_mode_id) {
+        setCurrentModeId(payload.current_mode_id);
+      } else if (payload.type === "permission_request" && payload.request_id && payload.message && payload.options) {
+        setPendingPermissions((prev) => [
+          ...prev,
+          {
+            id: payload.request_id!,
+            sessionId: payload.session_id,
+            message: payload.message!,
+            options: payload.options!,
+          },
+        ]);
       }
     });
 
@@ -109,8 +169,9 @@ function App() {
     () => [
       { label: "Session", value: sessionStatus },
       { label: "Agent", value: selectedAgentId ?? "none" },
+      { label: "Mode", value: currentModeId ?? "default" },
     ],
-    [selectedAgentId, sessionStatus],
+    [selectedAgentId, sessionStatus, currentModeId],
   );
 
   const truncatePath = (value: string | null, max = 48) => {
@@ -200,16 +261,24 @@ function App() {
     setSessionStatus("starting");
     try {
       const info = await invoke<SessionInfo>("acp_start_session", {
-        agent_id: selectedAgentId,
-        root_dir: openPath,
+        // NOTE: keys must be camelCase here because the Tauri command expects agentId/rootDir
+        agentId: selectedAgentId,
+        rootDir: openPath,
       });
       setSessionId(info.session_id);
+      if (info.modes) {
+        setAvailableModes(info.modes.available_modes);
+        setCurrentModeId(info.modes.current_mode_id);
+      } else {
+        setAvailableModes([]);
+        setCurrentModeId(null);
+      }
       setSessionStatus("active");
       appendStatus(`Session started (${info.agent_id}).`);
     } catch (err) {
       console.error("Failed to start ACP session", err);
       setSessionStatus("error");
-      appendStatus("Failed to start ACP session.");
+      appendStatus(`Failed to start ACP session: ${formatInvokeError(err)}`);
     }
   };
 
@@ -218,6 +287,9 @@ function App() {
       await invoke("acp_stop_session");
       setSessionId(null);
       setSessionStatus("idle");
+      setAvailableModes([]);
+      setCurrentModeId(null);
+      setPendingPermissions([]);
       appendStatus("Session stopped.");
     } catch (err) {
       console.error("Failed to stop session", err);
@@ -244,6 +316,29 @@ function App() {
     } catch (err) {
       console.error("Failed to send prompt", err);
       appendStatus("Prompt failed to send.");
+    }
+  };
+
+  const handleModeSelect = async (modeId: string) => {
+    if (!sessionId) return;
+    setCurrentModeId(modeId);
+    try {
+      await invoke("acp_set_mode", { mode_id: modeId });
+      appendStatus(`Mode set to ${modeId}.`);
+    } catch (err) {
+      console.error("Failed to set mode", err);
+      appendStatus(`Failed to set mode: ${formatInvokeError(err)}`);
+    }
+  };
+
+  const handleResolvePermission = async (requestId: string, optionId: string | null) => {
+    setPendingPermissions((prev) => prev.filter((req) => req.id !== requestId));
+    try {
+      await invoke("acp_resolve_permission", { request_id: requestId, option_id: optionId });
+      appendStatus(optionId ? `Permission granted (${optionId}).` : "Permission denied.");
+    } catch (err) {
+      console.error("Failed to resolve permission", err);
+      appendStatus(`Permission resolution failed: ${formatInvokeError(err)}`);
     }
   };
 
@@ -300,6 +395,25 @@ function App() {
                 </span>
               ))}
             </div>
+
+            {availableModes.length > 0 && (
+              <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-300">
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">
+                  Mode
+                </span>
+                <select
+                  value={currentModeId ?? ""}
+                  onChange={(event) => handleModeSelect(event.target.value)}
+                  className="rounded-full border border-white/10 bg-slate-900/60 px-3 py-1 text-[11px] text-slate-200 focus:border-emerald-400/50 focus:outline-none"
+                >
+                  {availableModes.map((mode) => (
+                    <option key={mode.id} value={mode.id}>
+                      {mode.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             <div className="mt-5 flex-1 space-y-4 overflow-y-auto pr-1">
               {chatEntries.length === 0 ? (
@@ -484,6 +598,38 @@ function App() {
           </section>
         </div>
       </div>
+
+      {pendingPermissions.length > 0 && (
+        <div className="fixed inset-0 z-20 flex items-center justify-center bg-slate-950/70 backdrop-blur">
+          <div className="w-[420px] rounded-2xl border border-white/10 bg-slate-900/90 p-6 shadow-xl">
+            {pendingPermissions.map((request) => (
+              <div key={request.id} className="space-y-4">
+                <div className="text-sm font-semibold text-white">
+                  Permission required
+                </div>
+                <div className="text-sm text-slate-300">{request.message}</div>
+                <div className="flex flex-wrap gap-2">
+                  {request.options.map((option) => (
+                    <button
+                      key={option.option_id}
+                      onClick={() => void handleResolvePermission(request.id, option.option_id)}
+                      className="rounded-full border border-emerald-400/40 bg-emerald-500/20 px-3 py-1 text-[12px] font-semibold text-emerald-100 hover:bg-emerald-500/30"
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => void handleResolvePermission(request.id, null)}
+                    className="rounded-full border border-white/10 bg-white/10 px-3 py-1 text-[12px] text-slate-200 hover:bg-white/20"
+                  >
+                    Deny
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

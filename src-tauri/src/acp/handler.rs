@@ -1,15 +1,15 @@
 use agent_client_protocol::{
     AgentNotification, AgentRequest, ClientCapabilities, ClientResponse, ContentBlock,
-    CreateTerminalRequest, CreateTerminalResponse, FileSystemCapability, KillTerminalCommandResponse,
-    MessageHandler, PermissionOptionKind, ReadTextFileResponse, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, TerminalExitStatus, TerminalId, TerminalOutputRequest,
-    TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileResponse,
+    CreateTerminalRequest, CreateTerminalResponse, CurrentModeUpdate, FileSystemCapability,
+    KillTerminalCommandResponse, MessageHandler, ReadTextFileResponse, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionModeState, SessionNotification, SessionUpdate,
+    TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileResponse,
 };
 use agent_client_protocol::{
-    Error, KillTerminalCommandRequest, ReadTextFileRequest, ReleaseTerminalRequest,
-    RequestPermissionRequest, Result, WriteTextFileRequest,
+    Error, KillTerminalCommandRequest, ReadTextFileRequest, ReleaseTerminalRequest, Result,
+    WriteTextFileRequest,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -21,7 +21,8 @@ use std::sync::{
 use tauri::Emitter;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::oneshot;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct VisorClient {
@@ -39,15 +40,25 @@ pub struct VisorClientState {
     app_handle: tauri::AppHandle,
     terminals: Arc<Mutex<HashMap<TerminalId, Arc<TerminalState>>>>,
     terminal_counter: AtomicUsize,
+    mode_state: Arc<RwLock<Option<SessionModeState>>>,
+    permission_requests: Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>,
+    permission_counter: AtomicUsize,
 }
 
 impl VisorClientState {
-    pub fn new(root_dir: PathBuf, app_handle: tauri::AppHandle) -> Self {
+    pub fn new(
+        root_dir: PathBuf,
+        app_handle: tauri::AppHandle,
+        mode_state: Arc<RwLock<Option<SessionModeState>>>,
+    ) -> Self {
         Self {
             root_dir,
             app_handle,
             terminals: Arc::new(Mutex::new(HashMap::new())),
             terminal_counter: AtomicUsize::new(1),
+            mode_state,
+            permission_requests: Arc::new(Mutex::new(HashMap::new())),
+            permission_counter: AtomicUsize::new(1),
         }
     }
 
@@ -58,6 +69,29 @@ impl VisorClientState {
 
     fn emit_event(&self, event: AcpUiEvent) {
         let _ = self.app_handle.emit("acp://update", event);
+    }
+
+    pub async fn resolve_permission(
+        &self,
+        request_id: &str,
+        option_id: Option<String>,
+    ) -> Result<(), String> {
+        let sender = {
+            let mut guard = self.permission_requests.lock().await;
+            guard.remove(request_id)
+        };
+
+        let Some(sender) = sender else {
+            return Err("unknown permission request".to_string());
+        };
+
+        let outcome = match option_id {
+            Some(id) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+            None => RequestPermissionOutcome::Cancelled,
+        };
+
+        let _ = sender.send(outcome);
+        Ok(())
     }
 
     fn validate_path(&self, path: &Path, allow_missing: bool) -> Result<PathBuf> {
@@ -108,6 +142,19 @@ pub enum AcpUiEvent {
     ChatMessage { session_id: String, content: String },
     StatusUpdate { session_id: String, content: String },
     Error { session_id: String, content: String },
+    ModeChanged { session_id: String, current_mode_id: String },
+    PermissionRequest {
+        request_id: String,
+        session_id: String,
+        message: String,
+        options: Vec<PermissionOptionPayload>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissionOptionPayload {
+    pub option_id: String,
+    pub label: String,
 }
 
 struct TerminalState {
@@ -152,7 +199,8 @@ impl MessageHandler<agent_client_protocol::ClientSide> for VisorClient {
         async move {
             match request {
                 AgentRequest::RequestPermissionRequest(req) => {
-                    Ok(ClientResponse::RequestPermissionResponse(handle_permission(req)))
+                    let response = handle_permission(&state, req).await?;
+                    Ok(ClientResponse::RequestPermissionResponse(response))
                 }
                 AgentRequest::ReadTextFileRequest(req) => {
                     Ok(ClientResponse::ReadTextFileResponse(handle_read_text(&state, req).await?))
@@ -197,7 +245,7 @@ impl MessageHandler<agent_client_protocol::ClientSide> for VisorClient {
         async move {
             match notification {
                 AgentNotification::SessionNotification(note) => {
-                    emit_session_update(&state, note);
+                    emit_session_update(&state, note).await;
                     Ok(())
                 }
                 AgentNotification::ExtNotification(_) => Ok(()),
@@ -207,21 +255,49 @@ impl MessageHandler<agent_client_protocol::ClientSide> for VisorClient {
     }
 }
 
-fn handle_permission(request: RequestPermissionRequest) -> RequestPermissionResponse {
-    let selected = request
+async fn handle_permission(
+    state: &VisorClientState,
+    request: RequestPermissionRequest,
+) -> Result<RequestPermissionResponse> {
+    let request_id = format!(
+        "perm-{}",
+        state.permission_counter.fetch_add(1, Ordering::SeqCst)
+    );
+
+    let message = request
+        .tool_call
+        .fields
+        .title
+        .clone()
+        .unwrap_or_else(|| "Permission requested".to_string());
+
+    let options_payload = request
         .options
         .iter()
-        .find(|option| matches!(option.kind, PermissionOptionKind::AllowOnce))
-        .or_else(|| request.options.iter().find(|option| matches!(option.kind, PermissionOptionKind::AllowAlways)))
-        .or_else(|| request.options.first())
-        .map(|option| SelectedPermissionOutcome::new(option.option_id.clone()));
+        .map(|option| PermissionOptionPayload {
+            option_id: option.option_id.to_string(),
+            label: option.name.clone(),
+        })
+        .collect::<Vec<_>>();
 
-    let outcome = match selected {
-        Some(selection) => RequestPermissionOutcome::Selected(selection),
-        None => RequestPermissionOutcome::Cancelled,
-    };
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut guard = state.permission_requests.lock().await;
+        guard.insert(request_id.clone(), tx);
+    }
 
-    RequestPermissionResponse::new(outcome)
+    state.emit_event(AcpUiEvent::PermissionRequest {
+        request_id: request_id.clone(),
+        session_id: request.session_id.to_string(),
+        message,
+        options: options_payload,
+    });
+
+    let outcome = rx
+        .await
+        .unwrap_or(RequestPermissionOutcome::Cancelled);
+
+    Ok(RequestPermissionResponse::new(outcome))
 }
 
 async fn handle_read_text(state: &VisorClientState, req: ReadTextFileRequest) -> Result<ReadTextFileResponse> {
@@ -420,7 +496,7 @@ async fn handle_release_terminal(
     Ok(())
 }
 
-fn emit_session_update(state: &VisorClientState, note: SessionNotification) {
+async fn emit_session_update(state: &VisorClientState, note: SessionNotification) {
     let session_id = note.session_id.to_string();
     match note.update {
         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -440,6 +516,18 @@ fn emit_session_update(state: &VisorClientState, note: SessionNotification) {
             state.emit_event(AcpUiEvent::StatusUpdate {
                 session_id,
                 content: format!("Plan received: {} steps", plan.entries.len()),
+            });
+        }
+        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate { current_mode_id, .. }) => {
+            let mut guard = state.mode_state.write().await;
+            if let Some(existing) = guard.as_mut() {
+                existing.current_mode_id = current_mode_id.clone();
+            } else {
+                *guard = Some(SessionModeState::new(current_mode_id.clone(), Vec::new()));
+            }
+            state.emit_event(AcpUiEvent::ModeChanged {
+                session_id,
+                current_mode_id: current_mode_id.to_string(),
             });
         }
         _ => {}

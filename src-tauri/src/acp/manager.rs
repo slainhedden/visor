@@ -1,8 +1,9 @@
 use crate::acp::config::{AgentConfig, AgentsConfig};
 use crate::acp::handler::{default_client_capabilities, VisorClient, VisorClientState};
 use agent_client_protocol::{
-    Agent, ClientSideConnection, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    ProtocolVersion, SessionId,
+    Agent, ClientSideConnection, ContentBlock, InitializeRequest, McpServer, McpServerStdio,
+    NewSessionRequest, PromptRequest, ProtocolVersion, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SetSessionModeRequest,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -25,6 +26,13 @@ pub struct AgentSummary {
 pub struct AcpSessionInfo {
     pub agent_id: String,
     pub session_id: String,
+    pub modes: Option<ModeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModeSummary {
+    pub current_mode_id: String,
+    pub available_modes: Vec<SessionMode>,
 }
 
 pub struct AcpManager {
@@ -77,10 +85,14 @@ impl AcpManager {
             .canonicalize()
             .map_err(|err| format!("invalid root dir: {err}"))?;
 
-        let (session, session_id) = spawn_session(app, agent, root_dir).await?;
+        let (session, mode_state) = spawn_session(app, agent, root_dir).await?;
         let session_info = AcpSessionInfo {
             agent_id: session.agent_id.clone(),
-            session_id: session_id.to_string(),
+            session_id: session.session_id.to_string(),
+            modes: mode_state.map(|modes| ModeSummary {
+                current_mode_id: modes.current_mode_id.to_string(),
+                available_modes: modes.available_modes.clone(),
+            }),
         };
 
         self.session = Some(session);
@@ -100,6 +112,26 @@ impl AcpManager {
             .as_ref()
             .ok_or_else(|| "ACP session not started".to_string())?;
         session.send_prompt(text).await
+    }
+
+    pub async fn set_mode(&self, mode_id: String) -> Result<(), String> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "ACP session not started".to_string())?;
+        session.set_mode(SessionModeId::new(mode_id)).await
+    }
+
+    pub async fn resolve_permission(
+        &self,
+        request_id: String,
+        option_id: Option<String>,
+    ) -> Result<(), String> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "ACP session not started".to_string())?;
+        session.resolve_permission(request_id, option_id).await
     }
 }
 
@@ -122,6 +154,10 @@ enum AcpCommand {
         text: String,
         respond: oneshot::Sender<Result<(), String>>,
     },
+    SetMode {
+        mode_id: SessionModeId,
+        respond: oneshot::Sender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -130,6 +166,10 @@ struct AcpSession {
     child: tokio::sync::Mutex<tokio::process::Child>,
     local_task: JoinHandle<()>,
     command_tx: mpsc::Sender<AcpCommand>,
+    session_id: SessionId,
+    #[allow(dead_code)] /* Left for future use, remove when implemented */
+    modes: Arc<RwLock<Option<SessionModeState>>>,
+    client_state: Arc<VisorClientState>,
 }
 
 impl AcpSession {
@@ -142,11 +182,33 @@ impl AcpSession {
         rx.await.map_err(|_| "ACP prompt canceled".to_string())?
     }
 
+    async fn set_mode(&self, mode_id: SessionModeId) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(AcpCommand::SetMode {
+                mode_id,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| "ACP command channel closed".to_string())?;
+        rx.await.map_err(|_| "ACP set mode canceled".to_string())?
+    }
+
     async fn shutdown(&mut self) {
         let _ = self.command_tx.send(AcpCommand::Shutdown).await;
         let _ = self.local_task.abort();
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
+    }
+
+    async fn resolve_permission(
+        &self,
+        request_id: String,
+        option_id: Option<String>,
+    ) -> Result<(), String> {
+        self.client_state
+            .resolve_permission(&request_id, option_id)
+            .await
     }
 }
 
@@ -154,7 +216,7 @@ async fn spawn_session(
     app: AppHandle,
     agent: AgentConfig,
     root_dir: PathBuf,
-) -> Result<(AcpSession, SessionId), String> {
+) -> Result<(AcpSession, Option<SessionModeState>), String> {
     let mut command = Command::new(&agent.command);
     command.args(&agent.args);
     command.current_dir(&root_dir);
@@ -179,13 +241,20 @@ async fn spawn_session(
         .take()
         .ok_or_else(|| "agent stdout unavailable".to_string())?;
 
-    let state = Arc::new(VisorClientState::new(root_dir.clone(), app));
-    let handler = VisorClient::new(state);
+    let mode_state: Arc<RwLock<Option<SessionModeState>>> = Arc::new(RwLock::new(None));
+    let state = Arc::new(VisorClientState::new(
+        root_dir.clone(),
+        app,
+        mode_state.clone(),
+    ));
+    let handler = VisorClient::new(state.clone());
 
     let (session_tx, session_rx) = oneshot::channel();
     let (command_tx, mut command_rx) = mpsc::channel::<AcpCommand>(16);
 
     let root_dir_for_task = root_dir.clone();
+    let agent_for_task = agent.clone();
+    let mode_state_for_task = mode_state.clone();
     let local_task = tauri::async_runtime::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -202,6 +271,12 @@ async fn spawn_session(
                 },
             );
 
+            tokio::task::spawn_local(async move {
+                if let Err(err) = io_task.await {
+                    eprintln!("ACP IO task error: {err}");
+                }
+            });
+
             let init = InitializeRequest::new(ProtocolVersion::LATEST)
                 .client_capabilities(default_client_capabilities());
             if let Err(err) = client.initialize(init).await {
@@ -210,7 +285,10 @@ async fn spawn_session(
             }
 
             let new_session = match client
-                .new_session(NewSessionRequest::new(&root_dir_for_task))
+                .new_session(
+                    NewSessionRequest::new(&root_dir_for_task)
+                        .mcp_servers(mcp_servers_from_config(&agent_for_task)),
+                )
                 .await
             {
                 Ok(response) => response,
@@ -221,32 +299,37 @@ async fn spawn_session(
             };
 
             let session_id = new_session.session_id.clone();
+            if let Some(modes) = new_session.modes.clone() {
+                let mut guard = mode_state_for_task.write().await;
+                *guard = Some(modes);
+            }
             let _ = session_tx.send(Ok(session_id.clone()));
 
-            tokio::pin!(io_task);
             loop {
-                tokio::select! {
-                    result = &mut io_task => {
-                        if let Err(err) = result {
-                            eprintln!("ACP IO task error: {err}");
-                        }
-                        break;
+                let Some(cmd) = command_rx.recv().await else {
+                    break;
+                };
+                match cmd {
+                    AcpCommand::Prompt { text, respond } => {
+                        let prompt =
+                            PromptRequest::new(session_id.clone(), vec![ContentBlock::from(text)]);
+                        let result = client
+                            .prompt(prompt)
+                            .await
+                            .map(|_| ())
+                            .map_err(|err| format!("prompt failed: {err}"));
+                        let _ = respond.send(result);
                     }
-                    maybe_cmd = command_rx.recv() => {
-                        let Some(cmd) = maybe_cmd else { break; };
-                        match cmd {
-                            AcpCommand::Prompt { text, respond } => {
-                                let prompt = PromptRequest::new(session_id.clone(), vec![ContentBlock::from(text)]);
-                                let result = client
-                                    .prompt(prompt)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(|err| format!("prompt failed: {err}"));
-                                let _ = respond.send(result);
-                            }
-                            AcpCommand::Shutdown => break,
-                        }
+                    AcpCommand::SetMode { mode_id, respond } => {
+                        let request = SetSessionModeRequest::new(session_id.clone(), mode_id);
+                        let result = client
+                            .set_session_mode(request)
+                            .await
+                            .map(|_| ())
+                            .map_err(|err| format!("set mode failed: {err}"));
+                        let _ = respond.send(result);
                     }
+                    AcpCommand::Shutdown => break,
                 }
             }
         }));
@@ -261,7 +344,34 @@ async fn spawn_session(
         child: tokio::sync::Mutex::new(child),
         local_task,
         command_tx,
+        session_id: session_id.clone(),
+        modes: mode_state.clone(),
+        client_state: state,
     };
 
-    Ok((session, session_id))
+    let modes = mode_state.read().await.clone();
+
+    Ok((session, modes))
+}
+
+fn mcp_servers_from_config(agent: &AgentConfig) -> Vec<McpServer> {
+    agent
+        .mcp_servers
+        .iter()
+        .map(|(name, config)| {
+            McpServer::Stdio(
+                McpServerStdio::new(name.clone(), &config.command)
+                    .args(config.args.clone())
+                    .env(
+                        config
+                            .env
+                            .iter()
+                            .map(|(k, v)| {
+                                agent_client_protocol::EnvVariable::new(k.clone(), v.clone())
+                            })
+                            .collect(),
+                    ),
+            )
+        })
+        .collect()
 }

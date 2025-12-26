@@ -72,3 +72,25 @@ pub async fn acp_send_prompt(text: String, state: State<'_, AcpState>) -> Result
         .ok_or_else(|| "ACP configuration not loaded".to_string())?;
     manager.send_prompt(text).await
 }
+
+#[tauri::command]
+pub async fn acp_set_mode(mode_id: String, state: State<'_, AcpState>) -> Result<(), String> {
+    let guard = state.manager.read().await;
+    let manager = guard
+        .as_ref()
+        .ok_or_else(|| "ACP configuration not loaded".to_string())?;
+    manager.set_mode(mode_id).await
+}
+
+#[tauri::command]
+pub async fn acp_resolve_permission(
+    request_id: String,
+    option_id: Option<String>,
+    state: State<'_, AcpState>,
+) -> Result<(), String> {
+    let guard = state.manager.read().await;
+    let manager = guard
+        .as_ref()
+        .ok_or_else(|| "ACP configuration not loaded".to_string())?;
+    manager.resolve_permission(request_id, option_id).await
+}

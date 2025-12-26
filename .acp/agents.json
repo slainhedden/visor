@@ -1,11 +1,11 @@
 {
-  "agents": [
-    {
-      "id": "opencode",
+  "version": 1,
+  "agents": {
+    "opencode": {
       "label": "OpenCode",
       "command": "opencode",
-      "args": [],
+      "args": ["acp"],
       "env": {}
     }
-  ]
+  }
 }
